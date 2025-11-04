@@ -15,7 +15,7 @@ let config: FilterConfig = {
 };
 
 export function setFilterConfig(newConfig: FilterConfig) {
-  config = newConfig;
+  config = { ...newConfig };
 }
 
 function isAppiumLog(line: string): boolean {
@@ -175,6 +175,40 @@ function isMeaningful(line: string, index: number, allLines: string[], context: 
   return false;
 }
 
+function shouldTruncateResponse(line: string): { truncate: boolean; truncated?: string; reason?: string } {
+  if (!config.enableResponseTruncation) {
+    return { truncate: false };
+  }
+
+  if (/Error|error|fail|null|undefined|status [4-5]\d{2}/i.test(line)) {
+    return { truncate: false, reason: 'contains_error' };
+  }
+
+  if (line.length < 500) {
+    return { truncate: false, reason: 'small_payload' };
+  }
+
+  if (/Got response with status 200.*value.*\{/.test(line)) {
+    const match = line.match(/value.*?(\{.+)/);
+    if (match && match[1].length > 500) {
+      const preview = match[1].substring(0, 200);
+      const truncated = line.replace(match[1], preview + `... [${match[1].length} chars truncated]`);
+      return { truncate: true, truncated };
+    }
+  }
+
+  if (/\[HTTP\] \[HTTP\] <--.*200.*\{/.test(line) && line.length > 1000) {
+    const jsonMatch = line.match(/(\{.+)/);
+    if (jsonMatch && jsonMatch[1].length > 500) {
+      const preview = jsonMatch[1].substring(0, 200);
+      const truncated = line.replace(jsonMatch[1], preview + `... [${jsonMatch[1].length} chars truncated]`);
+      return { truncate: true, truncated };
+    }
+  }
+
+  return { truncate: false };
+}
+
 function compressSessionSetup(lines: string[]): string[] {
   if (!config.enableSessionCompression) {
     return lines;
@@ -227,7 +261,178 @@ function compressSessionSetup(lines: string[]): string[] {
   return [...beforeSetup, ...compressed, ...afterSetup];
 }
 
-export function filterAppiumLogs(logContent: string): string | null {
+function extractElementIdFromError(line: string): string | null {
+  const elementIdMatch = line.match(/value\s+['"]([^"']+)['"]|unable to find.*value\s+['"]([^"']+)['"]/i);
+  if (elementIdMatch) {
+    return elementIdMatch[1] || elementIdMatch[2];
+  }
+  return null;
+}
+
+function findElementIdInContext(allLines: string[], index: number): string | null {
+  for (let i = index - 1; i >= 0 && i >= index - 10; i--) {
+    const elementId = extractElementIdFromError(allLines[i]);
+    if (elementId) {
+      return elementId;
+    }
+    if (/Got response with status 404.*value.*["']/i.test(allLines[i])) {
+      const elementId = extractElementIdFromError(allLines[i]);
+      if (elementId) {
+        return elementId;
+      }
+    }
+  }
+  return null;
+}
+
+function isCriticalLine(line: string, allLines: string[], index: number): boolean {
+  if (/Error|Exception|Failed|Cannot|NoSuchElement/i.test(line)) return true;
+
+  if (/\[HTTP\].*-->/i.test(line)) {
+    if (/value.*['"][^'"]{3,}['"]|id.*['"][^'"]{3,}['"]|using.*['"][^'"]{3,}['"]/i.test(line)) return true;
+    if (index + 1 < allLines.length) {
+      const nextLine = allLines[index + 1];
+      if (nextLine && /value.*["'][^"']{3,}["']|id.*["'][^"']{3,}["']|using.*["'][^"']{3,}["']|text.*["'][^"']{3,}["']/i.test(nextLine)) {
+        return true;
+      }
+    }
+  }
+
+  if (/\[HTTP\].*<--.*\s(4\d{2}|5\d{2})\s/i.test(line)) return true;
+
+  if (/at\s+\w+|traceback|stack/i.test(line)) return true;
+
+  if (/^[^{]*\{.*value.*["']|^[^{]*\{.*id.*["']|^[^{]*\{.*using.*["']/i.test(line)) return true;
+
+  if (/Matched W3C error code|Encountered internal error running command|NoSuchElementError/i.test(line)) {
+    const elementId = extractElementIdFromError(line) || findElementIdInContext(allLines, index);
+    if (elementId) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+function groupSimilarLines(lines: string[], threshold = 0.85): Array<{ lines: string[]; count: number; pattern: string }> {
+  if (!config.enableHTTPGrouping) {
+    return lines.map(line => ({ lines: [line], count: 1, pattern: cleanLogLine(line) }));
+  }
+
+  const groups: Array<{ lines: string[]; count: number; pattern: string }> = [];
+  const processed = new Set<number>();
+  const cleanedPatterns = lines.map(l => cleanLogLine(l));
+
+  for (let i = 0; i < lines.length; i++) {
+    if (processed.has(i)) continue;
+
+    const group = {
+      lines: [lines[i]],
+      count: 1,
+      pattern: cleanedPatterns[i]
+    };
+
+    const isCritical = isCriticalLine(lines[i], lines, i);
+
+    for (let j = i + 1; j < lines.length; j++) {
+      if (processed.has(j)) continue;
+
+      const isJCritical = isCriticalLine(lines[j], lines, j);
+
+      if (isCritical && isJCritical) {
+        if (/\[HTTP\].*-->/i.test(lines[i]) && i + 1 < lines.length &&
+          /\[HTTP\].*-->/i.test(lines[j]) && j + 1 < lines.length) {
+          const nextI = lines[i + 1];
+          const nextJ = lines[j + 1];
+          if (nextI && /value.*["']|id.*["']|using.*["']/i.test(nextI) &&
+            nextJ && /value.*["']|id.*["']|using.*["']/i.test(nextJ)) {
+            const combinedI = cleanLogLine(lines[i]) + ' ' + cleanLogLine(nextI);
+            const combinedJ = cleanLogLine(lines[j]) + ' ' + cleanLogLine(nextJ);
+            if (combinedI === combinedJ) {
+              group.lines.push(lines[j]);
+              group.count++;
+              processed.add(j);
+              if (j + 1 < lines.length) processed.add(j + 1);
+            }
+            continue;
+          }
+        }
+
+        const elementIdI = extractElementIdFromError(lines[i]) || findElementIdInContext(lines, i);
+        const elementIdJ = extractElementIdFromError(lines[j]) || findElementIdInContext(lines, j);
+
+        if (elementIdI || elementIdJ) {
+          if (elementIdI && elementIdJ) {
+            if (elementIdI === elementIdJ) {
+              if (cleanedPatterns[i] === cleanedPatterns[j]) {
+                group.lines.push(lines[j]);
+                group.count++;
+                processed.add(j);
+              }
+            }
+          }
+          continue;
+        }
+
+        if (cleanedPatterns[i] === cleanedPatterns[j]) {
+          group.lines.push(lines[j]);
+          group.count++;
+          processed.add(j);
+        }
+        continue;
+      }
+
+      if (isCritical || isJCritical) continue;
+
+      if (cleanedPatterns[i] === cleanedPatterns[j]) {
+        group.lines.push(lines[j]);
+        group.count++;
+        processed.add(j);
+        continue;
+      }
+
+      const currentTokens = new Set(cleanedPatterns[i].toLowerCase().split(/\s+/));
+      const targetTokens = new Set(cleanedPatterns[j].toLowerCase().split(/\s+/));
+
+      const intersection = new Set(Array.from(currentTokens).filter(x => targetTokens.has(x)));
+      const unionSize = currentTokens.size + targetTokens.size - intersection.size;
+      const similarity = unionSize > 0 ? intersection.size / unionSize : 0;
+
+      if (similarity >= threshold) {
+        group.lines.push(lines[j]);
+        group.count++;
+        processed.add(j);
+      }
+    }
+
+    groups.push(group);
+    processed.add(i);
+  }
+
+  return groups;
+}
+
+function formatGroup(group: { lines: string[]; count: number; pattern: string }): string {
+  if (group.count === 1) return group.lines[0];
+
+  const first = group.lines[0];
+  const last = group.lines[group.lines.length - 1];
+
+  const timestampRegex = /(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}:\d{3})/;
+  const firstTs = first.match(timestampRegex)?.[1];
+  const lastTs = last.match(timestampRegex)?.[1];
+
+  const levelMatch = first.match(/\[([^\]]+)\]/);
+  const level = levelMatch ? levelMatch[1] : '';
+
+  const timeRange = firstTs && lastTs && firstTs !== lastTs
+    ? `${firstTs} → ${lastTs.split(' ').slice(-1)[0]}`
+    : firstTs || '';
+
+  return `${timeRange ? timeRange + ' ' : ''}${level ? '[' + level + '] ' : ''}[REPEATED ${group.count}x] ${group.pattern}`;
+}
+
+export function filterAppiumLogs(logContent: string, threshold = 0.85): string | null {
   if (!logContent || typeof logContent !== 'string') return null;
 
   const originalLines = logContent.split(/\r?\n/);
@@ -252,5 +457,17 @@ export function filterAppiumLogs(logContent: string): string | null {
 
   if (meaningful.length === 0) return null;
 
-  return meaningful.join('\n').trim() || null;
+  const processedMeaningful = meaningful.map(line => {
+    const truncation = shouldTruncateResponse(line);
+    if (truncation.truncate && truncation.truncated) {
+      return truncation.truncated;
+    }
+    return line;
+  });
+
+  const groups = groupSimilarLines(processedMeaningful, threshold);
+
+  const output = groups.map(g => formatGroup(g)).join('\n');
+
+  return output.trim() || null;
 }

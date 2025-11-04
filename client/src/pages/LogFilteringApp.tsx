@@ -13,6 +13,7 @@ export default function LogFilteringApp() {
   const [filteredLogs, setFilteredLogs] = useState("");
   const [filename, setFilename] = useState("");
   const [processingTime, setProcessingTime] = useState<number | undefined>();
+  const [searchQuery, setSearchQuery] = useState("");
   const [config, setConfig] = useState<FilterConfig>({
     enableResponseTruncation: true,
     enableStackCompression: true,
@@ -37,6 +38,7 @@ export default function LogFilteringApp() {
     (content: string, name: string) => {
       setOriginalLogs(content);
       setFilename(name);
+      setSearchQuery("");
       processLogs(content, config);
       toast({
         title: "File Loaded",
@@ -90,14 +92,19 @@ export default function LogFilteringApp() {
     setFilteredLogs("");
     setFilename("");
     setProcessingTime(undefined);
+    setSearchQuery("");
     toast({
       title: "Reset",
       description: "All data has been cleared",
     });
   }, [toast]);
 
-  const originalLineCount = originalLogs.split("\n").length;
-  const filteredLineCount = filteredLogs.split("\n").length;
+  const handleSearch = useCallback((query: string) => {
+    setSearchQuery(query);
+  }, []);
+
+  const originalLineCount = originalLogs ? originalLogs.split("\n").length : 0;
+  const filteredLineCount = filteredLogs ? filteredLogs.split("\n").length : 0;
 
   return (
     <div className="min-h-screen bg-background">
@@ -134,6 +141,7 @@ export default function LogFilteringApp() {
               onDownload={handleDownload}
               onCopy={handleCopy}
               onReset={handleReset}
+              onSearch={handleSearch}
             />
 
             <div className="grid grid-cols-1 lg:grid-cols-2 gap-6 h-[600px]">
@@ -142,12 +150,14 @@ export default function LogFilteringApp() {
                 content={originalLogs}
                 lineCount={originalLineCount}
                 testId="viewer-original"
+                searchQuery={searchQuery}
               />
               <LogViewer
                 title="Filtered Logs"
                 content={filteredLogs}
                 lineCount={filteredLineCount}
                 testId="viewer-filtered"
+                searchQuery={searchQuery}
               />
             </div>
           </div>
