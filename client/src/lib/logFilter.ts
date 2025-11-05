@@ -1,22 +1,4 @@
-export interface FilterConfig {
-  enableResponseTruncation: boolean;
-  enableStackCompression: boolean;
-  enableSessionCompression: boolean;
-  enableHTTPGrouping: boolean;
-  enableContextAwareFiltering: boolean;
-}
 
-let config: FilterConfig = {
-  enableResponseTruncation: true,
-  enableStackCompression: true,
-  enableSessionCompression: true,
-  enableHTTPGrouping: true,
-  enableContextAwareFiltering: true,
-};
-
-export function setFilterConfig(newConfig: FilterConfig) {
-  config = { ...newConfig };
-}
 
 function isAppiumLog(line: string): boolean {
   return /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}:\d{3} - \[/.test(line);
@@ -88,10 +70,18 @@ function isMeaningful(line: string, index: number, allLines: string[], context: 
     return true;
   }
 
-  const hasError = /Error|Exception|Failed|Cannot|NoSuchElement|Timeout|InvalidArgument|StaleElement|status [4-5]\d{2}/i.test(line);
+  const hasError = /Error|Exception|Failed|Cannot|NoSuchElement|Timeout|InvalidArgument|StaleElement|status [4-5]\d{2}|exit.*code [1-9]\d*|exited with code [1-9]\d*/i.test(line);
   if (hasError) return true;
 
   if (excludePatterns.some(p => p.test(line))) return false;
+
+  const sourceMatch = line.match(/\[(?:debug|info|warn|error)\] \[([^\]]+)\]/i) || 
+                      line.match(/^.*? - \[([^\]]+)\]/);
+  const source = sourceMatch ? sourceMatch[1].toLowerCase() : '';
+  const criticalSources = ['idevice', 'xcuitest', 'wdproxy', 'w3c', 'webdriveragent', 'wda'];
+  if (criticalSources.some(cs => source.includes(cs))) {
+    return true;
+  }
 
   if (level.includes('http')) {
     if (/\[HTTP\] \[HTTP\] -->/.test(line)) {
@@ -305,10 +295,7 @@ function isCriticalLine(line: string, allLines: string[], index: number): boolea
   if (/^[^{]*\{.*value.*["']|^[^{]*\{.*id.*["']|^[^{]*\{.*using.*["']/i.test(line)) return true;
 
   if (/Matched W3C error code|Encountered internal error running command|NoSuchElementError/i.test(line)) {
-    const elementId = extractElementIdFromError(line) || findElementIdInContext(allLines, index);
-    if (elementId) {
-      return true;
-    }
+    return true;
   }
 
   return false;
@@ -362,6 +349,7 @@ function groupSimilarLines(lines: string[], threshold = 0.85): Array<{ lines: st
         const elementIdJ = extractElementIdFromError(lines[j]) || findElementIdInContext(lines, j);
 
         if (elementIdI || elementIdJ) {
+          // At least one line has an element ID - use element ID matching
           if (elementIdI && elementIdJ) {
             if (elementIdI === elementIdJ) {
               if (cleanedPatterns[i] === cleanedPatterns[j]) {
@@ -375,9 +363,12 @@ function groupSimilarLines(lines: string[], threshold = 0.85): Array<{ lines: st
         }
 
         if (cleanedPatterns[i] === cleanedPatterns[j]) {
-          group.lines.push(lines[j]);
-          group.count++;
-          processed.add(j);
+          const lineDistance = Math.abs(j - i);
+          if (lineDistance <= 5) {
+            group.lines.push(lines[j]);
+            group.count++;
+            processed.add(j);
+          }
         }
         continue;
       }
